@@ -521,25 +521,31 @@ class HATEmbeddings(nn.Module):
 
 
 class HATLayer(nn.Module):
-    def __init__(self, config, use_sentence_encoder=True, use_document_encoder=True):
+    def __init__(self, config, use_sentence_encoder=True, use_document_encoder=True, use_corpus_encoder=True):
         super().__init__()
         self.max_sentence_length = config.max_sentence_length
         self.max_sentences = config.max_sentences
         self.hidden_size = config.hidden_size
         self.use_document_encoder = use_document_encoder
         self.use_sentence_encoder = use_sentence_encoder
+        self.use_corpus_encoder = use_corpus_encoder
         if self.use_sentence_encoder:
             self.sentence_encoder = TransformerLayer(config)
         if self.use_document_encoder:
             self.document_encoder = TransformerLayer(config)
             self.position_embeddings = nn.Embedding(config.max_sentences+1, config.hidden_size,
                                                     padding_idx=config.pad_token_id)
+        if self.use_corpus_encoder:
+            self.corpus_encoder = TransformerLayer(config)
+            self.corpus_position_embeddings = nn.Embedding(config.max_corpi+1, config.hidden_size, 
+            padding_idx=config.pad_token_id)
 
     def forward(
         self,
         hidden_states,
         attention_mask=None,
         num_sentences=None,
+        num_corpus_units=None
         output_attentions=False,
     ):
 
@@ -581,8 +587,25 @@ class HATLayer(nn.Module):
             # replace sentence representative tokens
             outputs[:, ::self.max_sentence_length] = document_outputs[0]
 
+        corpus_encoder_outputs = (None, None)
+        if self.use_corpus_encoder:
+            # gather document representative tokens
+            document_global_tokens = outputs[:, ::self.config.max_document_length].clone()
+            document_attention_mask = attention_mask[:, :, :, ::self.config.max_document_length].clone()
+
+            document_positions = torch.arange(1, num_corpus_units+1).repeat(outputs.size(0), 1).to(outputs.device) \
+                                * (document_attention_mask.reshape(-1, num_corpus_units) >= -100).int().to(outputs.device)
+            document_global_tokens += self.corpus_position_embeddings(document_positions)
+
+            corpus_encoder_outputs = self.corpus_encoder(document_global_tokens,
+                                                        document_attention_mask,
+                                                        output_attentions=output_attentions)
+
+            # replace document representative tokens
+            outputs[:, ::self.config.max_document_length] = corpus_encoder_outputs[0]
+ 
         if output_attentions:
-            return outputs, sentence_outputs[1], document_outputs[1]
+            return outputs, sentence_outputs[1], document_outputs[1], 
 
         return outputs, None
 
@@ -626,7 +649,8 @@ class HATEncoder(nn.Module):
         self.config = config
         self.layer = nn.ModuleList([HATLayer(config,
                                                        use_sentence_encoder=self.config.encoder_layout[str(idx)]['sentence_encoder'],
-                                                       use_document_encoder=self.config.encoder_layout[str(idx)]['document_encoder'])
+                                                       use_document_encoder=self.config.encoder_layout[str(idx)]['document_encoder'],
+                                                       use_corpus_encoder=self.config.encoder_layour[str(idx)]['corpus_encoder'])
                                     for idx in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
